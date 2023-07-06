@@ -25,8 +25,7 @@ For more details, please refer to [this blog post (Automated Rapid Binary Triage
 2. Push to GitHub
 3. Profit
 
-<p float="left" style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;">
-    <img src="./docs/imgs/a.png" width="30%" />
-    <img src="./docs/imgs/b.png" width="30%" />
-    <img src="./docs/imgs/d.png" width="30%" />
-</p>
+
+    <img src="./docs/imgs/a.png"  />
+    <img src="./docs/imgs/b.png"  />
+    <img src="./docs/imgs/d.png"  />
