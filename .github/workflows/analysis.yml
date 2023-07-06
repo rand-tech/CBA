@@ -1,0 +1,187 @@
+name: Analysis
+
+on:
+  push:
+    paths:
+      - 'files/**'
+      - '!files/**.md'
+      - '!files/**.json'
+      - '!files/**.gzf'
+      - '!files/**.ghidra.cxx'
+env:
+  CAPA_SAVE_WORKSPACE: "True"
+
+jobs:
+  get-modified-files:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 2
+      - id: set-matrix
+        run: echo "matrix=$(python scripts/ci-newdiff.py)" >> $GITHUB_OUTPUT
+
+  setup-static:
+    name: Setup Static Analysis
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+        capa-version: ["v4.0.1"]
+        java-version: ["17"]
+        gradle-version: ["7.3"]
+        ghidra-version: ["10.3.1"]
+        public-version: ["PUBLIC_20230614"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v2
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin' 
+          java-version: ${{ matrix.java-version }}
+      - name: Set up Gradle ${{ matrix.gradle-version }} 
+        uses: gradle/gradle-build-action@v2
+        with:
+          gradle-version: ${{ matrix.gradle-version }}
+      - name: Cache Ghidra
+        uses: actions/cache@v3
+        with:
+          path: ./tools/ghidra
+          key: ${{ runner.os }}-ghidra-${{ matrix.ghidra-version }}
+
+      - name: Install Ghidra ${{ matrix.ghidra-version }}
+        run: |
+          if [[ ! -d "./tools/ghidra" ]]; then
+            wget "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${{ matrix.ghidra-version }}_build/ghidra_${{ matrix.ghidra-version }}_${{ matrix.public-version }}.zip" -O ghidra_${{ matrix.ghidra-version }}.zip      
+            unzip ghidra_${{ matrix.ghidra-version }}.zip -d ./tools/
+            
+            mv tools/ghidra_${{ matrix.ghidra-version }}_PUBLIC tools/ghidra
+          fi
+
+      - name: Cache capa
+        uses: actions/cache@v3
+        with:
+          path: ./tools/capa
+          key: ${{ runner.os }}-capa-${{ matrix.capa-version }}
+
+      - name: Install capa
+        run: |
+          if [[ ! -d "./tools/capa" ]]; then
+            pip install flare-capa
+            wget -q "https://github.com/mandiant/capa/releases/download/${{ matrix.capa-version }}/capa-${{ matrix.capa-version }}-linux.zip"
+            mkdir -p ./tools/capa
+            unzip capa-${{ matrix.capa-version }}-linux.zip -d ./tools/capa
+          fi
+
+  capa:
+    needs: [get-modified-files, setup-static]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{fromJson(needs.get-modified-files.outputs.matrix)}}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+    - name: Restore capa cache
+      uses: actions/cache/restore@v3
+      with:
+        path: ./tools/capa
+        key: ${{ runner.os }}-capa-${{ matrix.capa-version }}
+    - name: Analyze with capa
+      run: |
+        echo '```' >> ${{ matrix.fname }}.md
+        ./tools/capa/capa ${{ matrix.fname }} -v >> ${{ matrix.fname }}.md
+        echo '```' >> ${{ matrix.fname }}.md
+        ./tools/capa/capa -j ${{ matrix.fname }} > ${{ matrix.fname }}.json
+    - name: Upload analysis artifacts
+      uses: actions/upload-artifact@v3
+      with: 
+        name: analysis-artifacts-${{ matrix.fname_safe }}-capa
+        path: |
+          ${{ matrix.fname }}.md
+          ${{ matrix.fname }}.json
+
+  ghidra:
+    needs: [get-modified-files, capa]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{fromJson(needs.get-modified-files.outputs.matrix)}}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+    - name: Restore cache
+      uses: actions/cache/restore@v3
+      with:
+        path: ./tools/ghidra
+        key: ${{ runner.os }}-ghidra-${{ matrix.ghidra-version }}
+    - name: Download analysis artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: analysis-artifacts-${{ matrix.fname_safe }}-capa
+        path: ${{ matrix.parent }}
+
+    - name: Build
+      run: |
+        echo Analyzing file ${{ matrix.fname }}.
+        python scripts/ghidra-analysis.py ${{ matrix.fname }}
+        # check if {matrix.fname}.ghidra.cxx exists
+        if [ -f "${{ matrix.fname }}.ghidra.cxx" ]; then
+          echo "File ${{ matrix.fname }} analyzed successfully."
+        else
+          echo "File ${{ matrix.fname }} failed to analyze."
+          exit 1
+        fi
+
+    - name: Upload analysis artifacts from ghidra
+      uses: actions/upload-artifact@v3
+      with: 
+        name: analysis-artifacts-${{ matrix.fname_safe }}-ghidra
+        path: |
+          ${{ matrix.fname }}.gzf
+          ${{ matrix.fname }}.ghidra.cxx
+        retention-days: 5
+
+  commit:
+    needs: [get-modified-files, ghidra]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{fromJson(needs.get-modified-files.outputs.matrix)}}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+      with:
+        token: ${{ secrets.COMMIT_SECRET }}
+    - name: Download analysis artifacts capa
+      uses: actions/download-artifact@v3
+      with:
+        name: analysis-artifacts-${{ matrix.fname_safe }}-capa
+        path: ${{ matrix.parent }}
+    - name: Download analysis artifacts ghidra
+      uses: actions/download-artifact@v3
+      with:
+        name: analysis-artifacts-${{ matrix.fname_safe }}-ghidra
+        path: ${{ matrix.parent }}
+
+    - name: Commit analysis artifacts
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "action.github@example.com"
+        git pull --rebase
+        git add ${{ matrix.fname }}.md
+        git add ${{ matrix.fname }}.json
+        git add ${{ matrix.fname }}.gzf
+        git add ${{ matrix.fname }}.ghidra.cxx
+
+        git commit -m "add analysis artifacts for ${{ matrix.fname }}"
+        for i in {1..5}; do
+          git pull --rebase && git push && break 
+          echo "git pull failed, retrying..."
+          sleep $i
+        done
